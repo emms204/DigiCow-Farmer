@@ -59,8 +59,19 @@ E10_MIN_TRAIN_SIZE = 0.3
 E10_CLIP = (PROB_CLIP_MIN, PROB_CLIP_MAX)
 E10_SEED = RANDOM_SEED
 E10_BASELINE_PATH = Path(__file__).resolve().parent / "e10_baseline.json"
+E10_1_BEST_PATH = Path(__file__).resolve().parent / "e10_1_best.json"
 E10_PASS_DELTA_REPRO = 0.002
 E10_PASS_DELTA_HPO = 0.004
+
+# Optuna (why same score repeatedly / slow increase):
+# - Default sampler is TPESampler (Tree-structured Parzen Estimator). It fits
+#   distributions to "good" and "bad" trials and samples next params from
+#   regions where good trials are more likely. So it exploits more than
+#   explores: many trials are near previous good ones → similar scores;
+#   occasional jumps when a better region is found. That's by design, not a bug.
+# - Pruning (cutting off bad trials early) is opt-in (MedianPruner etc.); we
+#   don't use it here, so every trial runs to completion and is fully evaluated.
+# - For more random exploration use RandomSampler() in create_study(sampler=...).
 
 
 def rolling_forward_splits(
@@ -162,10 +173,13 @@ def run_single_e10_harness(
     ll_params_per_target: dict[str, dict] | None = None,
     auc_params_per_target: dict[str, dict] | None = None,
     num_boost_round: int | None = None,
+    feature_groups: dict[str, bool] | None = None,
 ) -> dict[str, Any]:
     """
     One run of E10 harness: Plan4-style dual heads (LL + AUC per target),
-    E0-style forward folds and as-of features, minimal features.
+    E0-style forward folds and as-of features.
+    feature_groups: if None, uses MINIMAL_FEATURE_GROUPS (caller should set
+      DIGICOW_MINIMAL_FEATURES=1 for minimal). Pass VETTED_FEATURE_GROUPS for E10.2.
     Returns weighted_score, per_fold_weighted_scores, fold_std, last_fold_score,
     oof_07_ll, oof_07_auc, ... and baseline_guardrail metrics.
     """
@@ -205,7 +219,7 @@ def run_single_e10_harness(
 
         prior_asof = prior_df[prior_df[DATE_COL] < train_cutoff].copy()
         fe = FeatureEngineer(prior_asof)
-        fe.set_feature_groups(MINIMAL_FEATURE_GROUPS)
+        fe.set_feature_groups(feature_groups if feature_groups is not None else MINIMAL_FEATURE_GROUPS)
         fe.fit(train_df.iloc[train_pos])
 
         X_tr = fe.transform(train_df.iloc[train_pos])
@@ -490,8 +504,12 @@ def _run_and_save_baseline_once(
     return payload
 
 
-def run_hpo(args: argparse.Namespace) -> int:
-    """E10.1: LGBM dual HPO with Optuna, guardrails, pass rule Δ >= +0.004."""
+def run_hpo(args: argparse.Namespace, sampler=None) -> int:
+    """E10.1: LGBM dual HPO with Optuna, guardrails, pass rule Δ >= +0.004.
+
+    sampler: Optuna sampler (e.g. RandomSampler(seed=...) for random search).
+             If None, uses default TPESampler.
+    """
     import optuna
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -516,6 +534,15 @@ def run_hpo(args: argparse.Namespace) -> int:
     logger.info("  Guardrails: 7d_ll not worse, worst_fold not worse, fold_std controlled")
     logger.info("  Pass rule: Δweighted >= +%.4f", E10_PASS_DELTA_HPO)
     logger.info("=" * 70)
+
+    # Quiet per-fold and feature-engineering logs during HPO (summary only)
+    _noisy_loggers = [
+        logging.getLogger("shared.feature_engineering"),
+        logging.getLogger(__name__),
+    ]
+    _saved_levels = [log.level for log in _noisy_loggers]
+    for log in _noisy_loggers:
+        log.setLevel(logging.WARNING)
 
     # Study key: which head to tune (one at a time; others use defaults)
     def _make_objective(study_key: str):
@@ -632,7 +659,11 @@ def run_hpo(args: argparse.Namespace) -> int:
 
     for sk in studies_to_run:
         logger.info("\n--- Optuna study: %s (n_trials=%d) ---", sk, args.n_trials)
-        study = optuna.create_study(direction="maximize", study_name=f"e10_{sk}")
+        study = optuna.create_study(
+            direction="maximize",
+            study_name=f"e10_{sk}",
+            sampler=sampler,
+        )
         study.optimize(_make_objective(sk), n_trials=args.n_trials, show_progress_bar=True)
         if study.best_trial is not None and study.best_value > baseline_weighted:
             logger.info(
@@ -647,6 +678,10 @@ def run_hpo(args: argparse.Namespace) -> int:
         else:
             logger.info("  No improvement over baseline for %s", sk)
 
+    # Restore log levels
+    for log, level in zip(_noisy_loggers, _saved_levels):
+        log.setLevel(level)
+
     delta = best_overall - baseline_weighted
     passed = delta >= E10_PASS_DELTA_HPO
 
@@ -658,6 +693,12 @@ def run_hpo(args: argparse.Namespace) -> int:
     logger.info("  Pass (Δ >= %.4f): %s", E10_PASS_DELTA_HPO, "PASS" if passed else "FAIL")
     if best_params:
         logger.info("  Best params keys: %s", list(best_params.keys()))
+    # Persist E10.1 best for E10.2 comparison (keep only if better than E10.2)
+    E10_1_BEST_PATH.write_text(
+        json.dumps({"weighted_score": best_overall, "best_params": best_params}, indent=2),
+        encoding="utf-8",
+    )
+    logger.info("  E10.1 best saved to %s", E10_1_BEST_PATH)
     logger.info("=" * 70)
 
     return 0 if passed else 1

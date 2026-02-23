@@ -63,6 +63,21 @@ MINIMAL_FEATURE_GROUPS: dict[str, bool] = {
     "quality_features": False,
 }
 
+# Vetted set: evaluated in evaluate_new_features.py; keep confidence_aggregates + recency_intensity.
+# Use for E10.2 and any "best feature set" track (excludes interactions, quality_features).
+VETTED_FEATURE_GROUPS: dict[str, bool] = {
+    "direct_features": True,
+    "date_features": True,
+    "topic_features": True,
+    "trainer_features": True,
+    "prior_farmer_history": True,
+    "aggregation_features": True,
+    "confidence_aggregates": True,
+    "interactions": False,
+    "recency_intensity": True,
+    "quality_features": False,
+}
+
 
 class FeatureEngineer:
     """Build a feature matrix from raw DataFrames.
