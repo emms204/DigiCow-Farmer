@@ -2,10 +2,14 @@
 """
 Master runner — execute all plans and compare run results.
 
+Calibration: all plans use ISOTONIC by default. Set DIGICOW_CALIBRATION=none
+(or run with --no-calibration) to disable calibration (use NONE).
+
 Usage:
-    python run_all.py              # run all plans
+    python run_all.py              # run all plans (1–6, 8), ISOTONIC calibration
     python run_all.py 1 3          # run only Plan 1 and Plan 3
-    python run_all.py --minimal-features   # run all 6 plans with minimal (9) features only, then evaluate
+    python run_all.py --no-calibration    # disable calibration for all plans
+    python run_all.py --minimal-features  # minimal features, then evaluate
 """
 
 import argparse
@@ -32,6 +36,36 @@ try:
 except Exception:
     HAS_PLAN6 = False
 
+from plan8.model import run_plan8_oof
+from shared.data_loader import DataLoader
+from e0_reproducibility import (
+    E0_MIN_TRAIN_SIZE,
+    E0_N_SPLITS,
+    E0_SEED,
+    rolling_forward_splits,
+)
+
+
+class Plan8Runner:
+    """Plan 8: Cohort-Aware Mixture + Multi-Calibration. Runs OOF only (no test submission in this codebase)."""
+
+    def run(self) -> Path | str:
+        from shared.constants import DATE_COL
+
+        import pandas as pd
+
+        loader = DataLoader()
+        train_df, _test_df, prior_df, _ = loader.load_all()
+        train_df = train_df.copy()
+        prior_df = prior_df.copy()
+        train_df[DATE_COL] = pd.to_datetime(train_df[DATE_COL])
+        prior_df[DATE_COL] = pd.to_datetime(prior_df[DATE_COL])
+        splits = rolling_forward_splits(
+            train_df, n_splits=E0_N_SPLITS, min_train_size=E0_MIN_TRAIN_SIZE
+        )
+        run_plan8_oof(train_df, prior_df, splits, seed=E0_SEED)
+        return "Plan 8 OOF only (no test submission)"
+
 
 def main() -> None:
     logging.basicConfig(
@@ -47,19 +81,28 @@ def main() -> None:
         type=int,
         nargs="*",
         default=None,
-        help="Plan numbers to run (default: all 1–6)",
+        help="Plan numbers to run (default: all 1–6, 8)",
     )
     parser.add_argument(
         "--minimal-features",
         action="store_true",
         help="Use minimal (9) features only for all plans; then run evaluate_submissions.py",
     )
+    parser.add_argument(
+        "--no-calibration",
+        action="store_true",
+        help="Disable calibration (use NONE instead of ISOTONIC). Default: use ISOTONIC.",
+    )
     args = parser.parse_args()
+
+    if args.no_calibration:
+        os.environ["DIGICOW_CALIBRATION"] = "none"
+        logger.info("DIGICOW_CALIBRATION=none — all plans will skip calibration")
 
     requested = (
         set(args.plans)
         if args.plans is not None and len(args.plans) > 0
-        else {1, 2, 3, 4, 5, 6}
+        else {1, 2, 3, 4, 5, 6, 8}
     )
 
     if args.minimal_features:
@@ -79,6 +122,8 @@ def main() -> None:
         logger.warning(
             "Plan 6 requested but unavailable (missing dependencies). Skipping."
         )
+
+    plans.append((8, "Plan 8: Cohort Mixture + Multi-Calibration", Plan8Runner()))
 
     results: list[tuple[str, str, float]] = []
 

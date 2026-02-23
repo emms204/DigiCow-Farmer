@@ -21,6 +21,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from sklearn.metrics import log_loss, roc_auc_score
@@ -36,6 +37,11 @@ try:
 except ImportError:
     HAS_TORCH = False
 
+from plan4.config import (
+    AUC_PARAMS,
+    EARLY_STOPPING_ROUNDS as P4_ESR,
+    NUM_BOOST_ROUND as P4_NBR,
+)
 from plan6.config import (
     BATCH_SIZE,
     CALIBRATION,
@@ -54,7 +60,7 @@ from plan6.config import (
     SEED,
     WEIGHT_DECAY,
 )
-from shared.calibration import Calibrator, CalibrationMethod
+from shared.calibration import Calibrator, CalibrationMethod, get_default_calibration_method
 from shared.constants import ID_COL, PROB_CLIP_MAX, PROB_CLIP_MIN, TARGET_COLS
 from shared.data_loader import DataLoader
 from shared.evaluation import calculate_weighted_score
@@ -200,14 +206,13 @@ class HazardNeuralModel:
 
         test_preds = np.clip(test_preds_sum, PROB_CLIP_MIN, PROB_CLIP_MAX)
 
-        if self.calibration == "platt":
-            logger.info("Applying Platt calibration on OOF predictions")
+        cal_method = get_default_calibration_method()
+        if cal_method != CalibrationMethod.NONE:
+            logger.info("Applying %s calibration on OOF predictions", cal_method.name)
             for i, target in enumerate(TARGET_COLS):
-                cal = Calibrator(CalibrationMethod.PLATT)
+                cal = Calibrator(cal_method)
                 cal.fit(y_train[target].values[oof_mask], oof_preds[oof_mask, i])
                 test_preds[:, i] = cal.transform(test_preds[:, i])
-        elif self.calibration != "none":
-            logger.warning("Unknown calibration '%s' ignored", self.calibration)
 
         # Keep hierarchy after calibration.
         p7, p90, p120 = Calibrator.enforce_hierarchy(
@@ -225,10 +230,49 @@ class HazardNeuralModel:
         logger.info("\n%s CV Summary:\n%s", self.plan_name, cv_result.summary().to_string())
 
         preds_map = {target: test_preds[:, i] for i, target in enumerate(TARGET_COLS)}
+
+        # AUC columns: LightGBM trained for AUC on same features/splits
+        logger.info("Training LightGBM AUC models for AUC columns …")
+        preds_auc_map: dict[str, np.ndarray] = {}
+        for i, target in enumerate(TARGET_COLS):
+            y = y_train[target]
+            test_auc_sum = np.zeros(len(X_test))
+            for fold_idx, (tr_idx, va_idx) in enumerate(splits):
+                train_ds = lgb.Dataset(
+                    X_train.iloc[tr_idx], label=y.iloc[tr_idx], free_raw_data=False
+                )
+                val_ds = lgb.Dataset(
+                    X_train.iloc[va_idx], label=y.iloc[va_idx], free_raw_data=False
+                )
+                booster = lgb.train(
+                    AUC_PARAMS,
+                    train_ds,
+                    num_boost_round=P4_NBR,
+                    valid_sets=[train_ds, val_ds],
+                    valid_names=["train", "valid"],
+                    callbacks=[lgb.early_stopping(P4_ESR, verbose=False)],
+                )
+                test_auc_sum += (
+                    booster.predict(X_test, num_iteration=booster.best_iteration)
+                    / n_folds_eff
+                )
+            preds_auc_map[target] = np.clip(test_auc_sum, PROB_CLIP_MIN, PROB_CLIP_MAX)
+        p7_a, p90_a, p120_a = Calibrator.enforce_hierarchy(
+            preds_auc_map[TARGET_COLS[0]],
+            preds_auc_map[TARGET_COLS[1]],
+            preds_auc_map[TARGET_COLS[2]],
+        )
+        preds_auc_map[TARGET_COLS[0]] = p7_a
+        preds_auc_map[TARGET_COLS[1]] = p90_a
+        preds_auc_map[TARGET_COLS[2]] = p120_a
+
         filename = submission_filename or f"{self.plan_name}_submission.csv"
         gen = SubmissionGenerator(sample_sub)
         path = gen.generate(
-            test_ids=test_df[ID_COL], predictions=preds_map, filename=filename
+            test_ids=test_df[ID_COL],
+            predictions=preds_map,
+            predictions_auc=preds_auc_map,
+            filename=filename,
         )
 
         logger.info("✓ %s complete → %s", self.plan_name, path)

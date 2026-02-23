@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-E10.2 — LGBM dual HPO with vetted feature set (separate script from E10.0/E10.1).
+E10.2 — LGBM HPO with vetted feature set (single model per target).
 
 Same as E10.1 but:
   - Vetted features: confidence_aggregates + recency_intensity (VETTED_FEATURE_GROUPS).
@@ -10,7 +10,7 @@ Same as E10.1 but:
 Prerequisite: Run E10.1 first so e10_1_best.json exists (or pass --e10-1-best SCORE).
 
 Usage:
-  python e10_2_vetted_hpo.py [--run-baseline-if-missing] [--study 7d_ll|all] [--n-trials 30]
+  python e10_2_vetted_hpo.py [--run-baseline-if-missing] [--study 7d|all] [--n-trials 30]
   python e10_2_vetted_hpo.py --e10-1-best 0.893  # if e10_1_best.json missing
 """
 
@@ -32,12 +32,11 @@ from shared.constants import DATE_COL, TARGET_COLS
 from shared.data_loader import DataLoader
 from shared.feature_engineering import VETTED_FEATURE_GROUPS
 
-# Import harness and defaults from E10 (minimal-features script)
+# Import harness and defaults from E10
 from e10_dual_hpo import (
     E10_N_SPLITS,
     E10_SEED,
     run_single_e10_harness,
-    _default_auc_params,
     _default_ll_params,
 )
 
@@ -152,81 +151,24 @@ def run_hpo(args: argparse.Namespace) -> int:
     def _make_objective(study_key: str):
         def objective(trial: optuna.Trial) -> float:
             ll_params_per_target = {t: _default_ll_params(E10_SEED) for t in TARGET_COLS}
-            auc_params_per_target = {t: _default_auc_params(E10_SEED) for t in TARGET_COLS}
             num_rounds = trial.suggest_int("num_boost_round", 300, 1500)
-
-            if study_key == "7d_ll":
-                ll_params_per_target[TARGET_COLS[0]] = {
-                    **_default_ll_params(E10_SEED),
-                    "learning_rate": trial.suggest_float("lr", 0.01, 0.08),
-                    "num_leaves": trial.suggest_int("num_leaves", 15, 45),
-                    "max_depth": trial.suggest_int("max_depth", 4, 7),
-                    "min_child_samples": trial.suggest_int("min_child_samples", 30, 80),
-                    "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
-                    "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
-                    "lambda_l1": trial.suggest_float("lambda_l1", 0.1, 2.0),
-                    "lambda_l2": trial.suggest_float("lambda_l2", 0.5, 3.0),
-                }
-            elif study_key == "7d_auc":
-                auc_params_per_target[TARGET_COLS[0]] = {
-                    **_default_auc_params(E10_SEED),
-                    "learning_rate": trial.suggest_float("lr", 0.02, 0.08),
-                    "num_leaves": trial.suggest_int("num_leaves", 40, 90),
-                    "max_depth": trial.suggest_int("max_depth", 5, 8),
-                    "min_child_samples": trial.suggest_int("min_child_samples", 15, 40),
-                    "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
-                    "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
-                    "lambda_l1": trial.suggest_float("lambda_l1", 0.02, 0.3),
-                    "lambda_l2": trial.suggest_float("lambda_l2", 0.2, 1.0),
-                }
-            elif study_key == "90d_ll":
-                ll_params_per_target[TARGET_COLS[1]] = {
-                    **_default_ll_params(E10_SEED),
-                    "learning_rate": trial.suggest_float("lr", 0.01, 0.08),
-                    "num_leaves": trial.suggest_int("num_leaves", 15, 45),
-                    "max_depth": trial.suggest_int("max_depth", 4, 7),
-                    "min_child_samples": trial.suggest_int("min_child_samples", 30, 80),
-                    "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
-                    "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
-                    "lambda_l1": trial.suggest_float("lambda_l1", 0.1, 2.0),
-                    "lambda_l2": trial.suggest_float("lambda_l2", 0.5, 3.0),
-                }
-            elif study_key == "90d_auc":
-                auc_params_per_target[TARGET_COLS[1]] = {
-                    **_default_auc_params(E10_SEED),
-                    "learning_rate": trial.suggest_float("lr", 0.02, 0.08),
-                    "num_leaves": trial.suggest_int("num_leaves", 40, 90),
-                    "max_depth": trial.suggest_int("max_depth", 5, 8),
-                    "min_child_samples": trial.suggest_int("min_child_samples", 15, 40),
-                    "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
-                    "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
-                    "lambda_l1": trial.suggest_float("lambda_l1", 0.02, 0.3),
-                    "lambda_l2": trial.suggest_float("lambda_l2", 0.2, 1.0),
-                }
-            elif study_key == "120d_ll":
-                ll_params_per_target[TARGET_COLS[2]] = {
-                    **_default_ll_params(E10_SEED),
-                    "learning_rate": trial.suggest_float("lr", 0.01, 0.08),
-                    "num_leaves": trial.suggest_int("num_leaves", 15, 45),
-                    "max_depth": trial.suggest_int("max_depth", 4, 7),
-                    "min_child_samples": trial.suggest_int("min_child_samples", 30, 80),
-                    "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
-                    "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
-                    "lambda_l1": trial.suggest_float("lambda_l1", 0.1, 2.0),
-                    "lambda_l2": trial.suggest_float("lambda_l2", 0.5, 3.0),
-                }
-            elif study_key == "120d_auc":
-                auc_params_per_target[TARGET_COLS[2]] = {
-                    **_default_auc_params(E10_SEED),
-                    "learning_rate": trial.suggest_float("lr", 0.02, 0.08),
-                    "num_leaves": trial.suggest_int("num_leaves", 40, 90),
-                    "max_depth": trial.suggest_int("max_depth", 5, 8),
-                    "min_child_samples": trial.suggest_int("min_child_samples", 15, 40),
-                    "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
-                    "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
-                    "lambda_l1": trial.suggest_float("lambda_l1", 0.02, 0.3),
-                    "lambda_l2": trial.suggest_float("lambda_l2", 0.2, 1.0),
-                }
+            tuned = {
+                **_default_ll_params(E10_SEED),
+                "learning_rate": trial.suggest_float("lr", 0.01, 0.08),
+                "num_leaves": trial.suggest_int("num_leaves", 15, 45),
+                "max_depth": trial.suggest_int("max_depth", 4, 7),
+                "min_child_samples": trial.suggest_int("min_child_samples", 30, 80),
+                "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
+                "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
+                "lambda_l1": trial.suggest_float("lambda_l1", 0.1, 2.0),
+                "lambda_l2": trial.suggest_float("lambda_l2", 0.5, 3.0),
+            }
+            if study_key == "7d":
+                ll_params_per_target[TARGET_COLS[0]] = tuned
+            elif study_key == "90d":
+                ll_params_per_target[TARGET_COLS[1]] = tuned
+            else:
+                ll_params_per_target[TARGET_COLS[2]] = tuned
 
             result = run_single_e10_harness(
                 train_df,
@@ -234,7 +176,6 @@ def run_hpo(args: argparse.Namespace) -> int:
                 n_splits=args.n_splits,
                 seed=E10_SEED,
                 ll_params_per_target=ll_params_per_target,
-                auc_params_per_target=auc_params_per_target,
                 num_boost_round=num_rounds,
                 feature_groups=VETTED_FEATURE_GROUPS,
             )
@@ -254,7 +195,7 @@ def run_hpo(args: argparse.Namespace) -> int:
         return objective
 
     studies_to_run = (
-        ["7d_ll", "7d_auc", "90d_ll", "90d_auc", "120d_ll", "120d_auc"]
+        ["7d", "90d", "120d"]
         if args.study == "all"
         else [args.study]
     )
@@ -314,16 +255,8 @@ def main() -> None:
     parser.add_argument(
         "--study",
         type=str,
-        default="7d_ll",
-        choices=[
-            "7d_ll",
-            "7d_auc",
-            "90d_ll",
-            "90d_auc",
-            "120d_ll",
-            "120d_auc",
-            "all",
-        ],
+        default="7d",
+        choices=["7d", "90d", "120d", "all"],
         help="Which head(s) to tune",
     )
     parser.add_argument("--n-splits", type=int, default=E10_N_SPLITS)

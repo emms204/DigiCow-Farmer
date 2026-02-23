@@ -1,0 +1,60 @@
+{
+  "weighted_score": 0.8950755176314739,
+  "best_params": {
+    "7d_ll": {
+      "num_boost_round": 1194,
+      "lr": 0.010446505147787583,
+      "num_leaves": 24,
+      "max_depth": 4,
+      "min_child_samples": 50,
+      "feature_fraction": 0.9530760531437782,
+      "bagging_fraction": 0.9197057472759294,
+      "lambda_l1": 1.8958987345583966,
+      "lambda_l2": 0.623554939203099
+    },
+    "90d_ll": {
+      "num_boost_round": 735,
+      "lr": 0.01976127141924355,
+      "num_leaves": 25,
+      "max_depth": 4,
+      "min_child_samples": 60,
+      "feature_fraction": 0.932001531678148,
+      "bagging_fraction": 0.936771595156582,
+      "lambda_l1": 0.7985760239294315,
+      "lambda_l2": 1.5066220015557377
+    },
+    "90d_auc": {
+      "num_boost_round": 1316,
+      "lr": 0.02885027355420925,
+      "num_leaves": 75,
+      "max_depth": 8,
+      "min_child_samples": 20,
+      "feature_fraction": 0.967271520637841,
+      "bagging_fraction": 0.9013434631623953,
+      "lambda_l1": 0.12287350082774963,
+      "lambda_l2": 0.5290774470222026
+    },
+    "120d_ll": {
+      "num_boost_round": 967,
+      "lr": 0.057660055870783745,
+      "num_leaves": 19,
+      "max_depth": 4,
+      "min_child_samples": 47,
+      "feature_fraction": 0.9984586656722247,
+      "bagging_fraction": 0.8092824226979621,
+      "lambda_l1": 1.3020311514254583,
+      "lambda_l2": 0.7895199450715228
+    },
+    "120d_auc": {
+      "num_boost_round": 1153,
+      "lr": 0.07554578686465367,
+      "num_leaves": 76,
+      "max_depth": 6,
+      "min_child_samples": 26,
+      "feature_fraction": 0.8842894938441268,
+      "bagging_fraction": 0.8220577089096489,
+      "lambda_l1": 0.1918640267517365,
+      "lambda_l2": 0.8285915249688032
+    }
+  }
+}

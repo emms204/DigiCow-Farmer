@@ -16,7 +16,7 @@ E10.1: LGBM dual HPO (minimal features)
 
 Usage:
   python e10_dual_hpo.py baseline [--runs 3] [--dry-run]   # E10.0
-  python e10_dual_hpo.py hpo [--n-trials 50] [--study 7d_ll]  # E10.1
+  python e10_dual_hpo.py hpo [--n-trials 50] [--study 7d]  # E10.1
 """
 
 from __future__ import annotations
@@ -44,7 +44,11 @@ from shared.constants import (
 )
 from shared.data_loader import DataLoader
 from shared.evaluation import calculate_weighted_score
-from shared.feature_engineering import MINIMAL_FEATURE_GROUPS, FeatureEngineer
+from shared.feature_engineering import (
+    MINIMAL_FEATURE_GROUPS,
+    FeatureEngineer,
+    VETTED_FEATURE_GROUPS,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -174,12 +178,17 @@ def run_single_e10_harness(
     auc_params_per_target: dict[str, dict] | None = None,
     num_boost_round: int | None = None,
     feature_groups: dict[str, bool] | None = None,
+    ll_calibration_per_target: dict[str, CalibrationMethod] | None = None,
 ) -> dict[str, Any]:
     """
-    One run of E10 harness: Plan4-style dual heads (LL + AUC per target),
-    E0-style forward folds and as-of features.
+    One run of E10 harness: single model per target (one column per target),
+    E0-style forward folds and as-of features. Same prediction used for both
+    LL and AUC in the weighted score (after calibration).
     feature_groups: if None, uses MINIMAL_FEATURE_GROUPS (caller should set
       DIGICOW_MINIMAL_FEATURES=1 for minimal). Pass VETTED_FEATURE_GROUPS for E10.2.
+    ll_calibration_per_target: if provided, use this CalibrationMethod per target
+      (keys = TARGET_COLS). If None, use ISOTONIC for all.
+    auc_params_per_target: ignored (kept for API compatibility).
     Returns weighted_score, per_fold_weighted_scores, fold_std, last_fold_score,
     oof_07_ll, oof_07_auc, ... and baseline_guardrail metrics.
     """
@@ -194,8 +203,6 @@ def run_single_e10_harness(
 
     if ll_params_per_target is None:
         ll_params_per_target = {t: _default_ll_params(seed) for t in TARGET_COLS}
-    if auc_params_per_target is None:
-        auc_params_per_target = {t: _default_auc_params(seed) for t in TARGET_COLS}
 
     n_rounds = num_boost_round if num_boost_round is not None else NUM_BOOST_ROUND
 
@@ -204,11 +211,8 @@ def run_single_e10_harness(
     )
     n_rows = len(train_df)
 
-    # OOF arrays: LL and AUC head per target
     oof_ll: dict[str, np.ndarray] = {t: np.zeros(n_rows, dtype=float) for t in TARGET_COLS}
-    oof_auc: dict[str, np.ndarray] = {t: np.zeros(n_rows, dtype=float) for t in TARGET_COLS}
     oof_mask = np.zeros(n_rows, dtype=bool)
-
     per_fold_weighted_scores: list[float] = []
 
     for split in splits:
@@ -224,7 +228,6 @@ def run_single_e10_harness(
 
         X_tr = fe.transform(train_df.iloc[train_pos])
         X_va = fe.transform(train_df.iloc[val_pos])
-
         fold_metrics: dict[str, float] = {}
 
         for target in TARGET_COLS:
@@ -232,46 +235,25 @@ def run_single_e10_harness(
             y_tr = y.iloc[train_pos].values
             y_va = y.iloc[val_pos].values
 
-            # LL head
-            train_set_ll = lgb.Dataset(X_tr, label=y_tr, free_raw_data=False)
-            val_set_ll = lgb.Dataset(X_va, label=y_va, free_raw_data=False)
-            booster_ll = lgb.train(
+            train_set = lgb.Dataset(X_tr, label=y_tr, free_raw_data=False)
+            val_set = lgb.Dataset(X_va, label=y_va, free_raw_data=False)
+            booster = lgb.train(
                 params=ll_params_per_target[target],
-                train_set=train_set_ll,
+                train_set=train_set,
                 num_boost_round=n_rounds,
-                valid_sets=[train_set_ll, val_set_ll],
+                valid_sets=[train_set, val_set],
                 valid_names=["train", "valid"],
                 callbacks=[lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False)],
             )
-            pred_ll_va = booster_ll.predict(X_va, num_iteration=booster_ll.best_iteration)
-            pred_ll_va = np.clip(pred_ll_va, *E10_CLIP)
-            oof_ll[target][val_pos] = pred_ll_va
-
-            # AUC head
-            train_set_auc = lgb.Dataset(X_tr, label=y_tr, free_raw_data=False)
-            val_set_auc = lgb.Dataset(X_va, label=y_va, free_raw_data=False)
-            booster_auc = lgb.train(
-                params=auc_params_per_target[target],
-                train_set=train_set_auc,
-                num_boost_round=n_rounds,
-                valid_sets=[train_set_auc, val_set_auc],
-                valid_names=["train", "valid"],
-                callbacks=[lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False)],
-            )
-            pred_auc_va = booster_auc.predict(X_va, num_iteration=booster_auc.best_iteration)
-            pred_auc_va = np.clip(pred_auc_va, *E10_CLIP)
-            oof_auc[target][val_pos] = pred_auc_va
-
+            pred_va = booster.predict(X_va, num_iteration=booster.best_iteration)
+            pred_va = np.clip(pred_va, *E10_CLIP)
+            oof_ll[target][val_pos] = pred_va
             oof_mask[val_pos] = True
 
-            ll_val = log_loss(y_va, pred_ll_va)
-            auc_val = (
-                roc_auc_score(y_va, pred_auc_va)
-                if len(np.unique(y_va)) > 1
-                else 0.5
+            fold_metrics[f"{target}_ll"] = log_loss(y_va, pred_va)
+            fold_metrics[f"{target}_auc"] = (
+                roc_auc_score(y_va, pred_va) if len(np.unique(y_va)) > 1 else 0.5
             )
-            fold_metrics[f"{target}_ll"] = ll_val
-            fold_metrics[f"{target}_auc"] = auc_val
 
         fold_weighted = calculate_weighted_score(
             fold_metrics["adopted_within_07_days_auc"],
@@ -287,7 +269,10 @@ def run_single_e10_harness(
             fold, len(train_pos), len(val_pos), fold_weighted,
         )
 
-    # Calibrate LL OOF per target (isotonic like Plan4)
+    _cal_method = ll_calibration_per_target or {}
+    def _method(t: str) -> CalibrationMethod:
+        return _cal_method.get(t, CalibrationMethod.ISOTONIC)
+
     oof_07_ll_raw = oof_ll[TARGET_COLS[0]][oof_mask]
     oof_90_ll_raw = oof_ll[TARGET_COLS[1]][oof_mask]
     oof_120_ll_raw = oof_ll[TARGET_COLS[2]][oof_mask]
@@ -295,27 +280,22 @@ def run_single_e10_harness(
     y_90 = train_df[TARGET_COLS[1]].values[oof_mask]
     y_120 = train_df[TARGET_COLS[2]].values[oof_mask]
 
-    cal_07 = Calibrator(CalibrationMethod.ISOTONIC)
+    cal_07 = Calibrator(_method(TARGET_COLS[0]))
     cal_07.fit(y_07, oof_07_ll_raw)
     oof_07_ll_cal = cal_07.transform(oof_07_ll_raw)
-    cal_90 = Calibrator(CalibrationMethod.ISOTONIC)
+    cal_90 = Calibrator(_method(TARGET_COLS[1]))
     cal_90.fit(y_90, oof_90_ll_raw)
     oof_90_ll_cal = cal_90.transform(oof_90_ll_raw)
-    cal_120 = Calibrator(CalibrationMethod.ISOTONIC)
+    cal_120 = Calibrator(_method(TARGET_COLS[2]))
     cal_120.fit(y_120, oof_120_ll_raw)
     oof_120_ll_cal = cal_120.transform(oof_120_ll_raw)
 
-    oof_07_auc = np.clip(oof_auc[TARGET_COLS[0]][oof_mask], *E10_CLIP)
-    oof_90_auc = np.clip(oof_auc[TARGET_COLS[1]][oof_mask], *E10_CLIP)
-    oof_120_auc = np.clip(oof_auc[TARGET_COLS[2]][oof_mask], *E10_CLIP)
-
-    # Enforce hierarchy on calibrated LL and AUC
     oof_07_ll_cal, oof_90_ll_cal, oof_120_ll_cal = Calibrator.enforce_hierarchy(
         oof_07_ll_cal, oof_90_ll_cal, oof_120_ll_cal
     )
-    oof_07_auc, oof_90_auc, oof_120_auc = Calibrator.enforce_hierarchy(
-        oof_07_auc, oof_90_auc, oof_120_auc
-    )
+    oof_07_auc = oof_07_ll_cal
+    oof_90_auc = oof_90_ll_cal
+    oof_120_auc = oof_120_ll_cal
 
     oof_07_ll = log_loss(y_07, oof_07_ll_cal)
     oof_07_auc_score = (
@@ -362,6 +342,317 @@ def run_single_e10_harness(
         "oof_90_auc": oof_90_auc_score,
         "oof_120_ll": oof_120_ll,
         "oof_120_auc": oof_120_auc_score,
+    }
+
+
+# ── XGBoost / CatBoost dual harness (E10.4 / E10.5, vetted features) ──
+
+def _default_xgb_ll_params(seed: int = E10_SEED) -> dict:
+    return {
+        "objective": "binary:logistic",
+        "eval_metric": "logloss",
+        "eta": 0.03,
+        "max_depth": 5,
+        "min_child_weight": 5,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "reg_alpha": 0.1,
+        "reg_lambda": 1.0,
+        "gamma": 0.0,
+        "scale_pos_weight": 1,
+        "verbosity": 0,
+        "random_state": seed,
+        "n_jobs": -1,
+    }
+
+
+def _default_xgb_auc_params(seed: int = E10_SEED) -> dict:
+    return {
+        "objective": "binary:logistic",
+        "eval_metric": "auc",
+        "eta": 0.04,
+        "max_depth": 6,
+        "min_child_weight": 3,
+        "subsample": 0.85,
+        "colsample_bytree": 0.85,
+        "reg_alpha": 0.05,
+        "reg_lambda": 0.5,
+        "gamma": 0.0,
+        "scale_pos_weight": 1,
+        "verbosity": 0,
+        "random_state": seed,
+        "n_jobs": -1,
+    }
+
+
+def _default_catboost_ll_params(seed: int = E10_SEED) -> dict:
+    return {
+        "loss_function": "Logloss",
+        "eval_metric": "Logloss",
+        "learning_rate": 0.05,
+        "depth": 6,
+        "l2_leaf_reg": 3.0,
+        "bagging_temperature": 0.2,
+        "random_strength": 0.1,
+        "border_count": 128,
+        "iterations": NUM_BOOST_ROUND,
+        "random_seed": seed,
+        "verbose": 0,
+        "allow_writing_files": False,
+        "use_best_model": True,
+    }
+
+
+def _default_catboost_auc_params(seed: int = E10_SEED) -> dict:
+    return {
+        "loss_function": "Logloss",
+        "eval_metric": "AUC",
+        "learning_rate": 0.06,
+        "depth": 7,
+        "l2_leaf_reg": 1.0,
+        "bagging_temperature": 0.2,
+        "random_strength": 0.1,
+        "border_count": 128,
+        "iterations": NUM_BOOST_ROUND,
+        "random_seed": seed,
+        "verbose": 0,
+        "allow_writing_files": False,
+        "use_best_model": True,
+    }
+
+
+def run_single_e10_harness_xgb(
+    train_df: pd.DataFrame,
+    prior_df: pd.DataFrame,
+    n_splits: int = E10_N_SPLITS,
+    seed: int = E10_SEED,
+    *,
+    ll_params_per_target: dict[str, dict] | None = None,
+    auc_params_per_target: dict[str, dict] | None = None,
+    num_boost_round: int | None = None,
+    feature_groups: dict[str, bool] | None = None,
+    ll_calibration_per_target: dict[str, CalibrationMethod] | None = None,
+) -> dict[str, Any]:
+    """Single model per target (XGBoost); vetted features (E10.4). Same prediction for LL and AUC."""
+    import xgboost as xgb
+    from sklearn.metrics import log_loss, roc_auc_score
+
+    np.random.seed(seed)
+    train_df = train_df.copy()
+    prior_df = prior_df.copy()
+    prior_df[DATE_COL] = pd.to_datetime(prior_df[DATE_COL])
+    train_df[DATE_COL] = pd.to_datetime(train_df[DATE_COL])
+    if ll_params_per_target is None:
+        ll_params_per_target = {t: _default_xgb_ll_params(seed) for t in TARGET_COLS}
+    n_rounds = num_boost_round if num_boost_round is not None else NUM_BOOST_ROUND
+    feature_groups = feature_groups or VETTED_FEATURE_GROUPS
+
+    splits = rolling_forward_splits(
+        train_df, n_splits=n_splits, min_train_size=E10_MIN_TRAIN_SIZE
+    )
+    n_rows = len(train_df)
+    oof_ll = {t: np.zeros(n_rows, dtype=float) for t in TARGET_COLS}
+    oof_mask = np.zeros(n_rows, dtype=bool)
+    per_fold_weighted_scores: list[float] = []
+
+    for split in splits:
+        fold, train_pos, val_pos, train_cutoff = (
+            split["fold"], split["train_pos"], split["val_pos"], split["train_cutoff"],
+        )
+        prior_asof = prior_df[prior_df[DATE_COL] < train_cutoff].copy()
+        fe = FeatureEngineer(prior_asof)
+        fe.set_feature_groups(feature_groups)
+        fe.fit(train_df.iloc[train_pos])
+        X_tr = fe.transform(train_df.iloc[train_pos])
+        X_va = fe.transform(train_df.iloc[val_pos])
+        fold_metrics: dict[str, float] = {}
+        for target in TARGET_COLS:
+            y_tr = train_df[target].iloc[train_pos].values
+            y_va = train_df[target].iloc[val_pos].values
+            dtrain = xgb.DMatrix(X_tr, label=y_tr)
+            dval = xgb.DMatrix(X_va, label=y_va)
+            p = {k: v for k, v in ll_params_per_target[target].items() if k != "n_estimators"}
+            booster = xgb.train(
+                p, dtrain, num_boost_round=n_rounds,
+                evals=[(dval, "val")], early_stopping_rounds=EARLY_STOPPING_ROUNDS, verbose_eval=False,
+            )
+            best_it = getattr(booster, "best_iteration", None) or (n_rounds - 1)
+            pred_va = np.clip(booster.predict(dval, iteration_range=(0, best_it + 1)), *E10_CLIP)
+            oof_ll[target][val_pos] = pred_va
+            oof_mask[val_pos] = True
+            fold_metrics[f"{target}_ll"] = float(log_loss(y_va, pred_va))
+            fold_metrics[f"{target}_auc"] = (
+                float(roc_auc_score(y_va, pred_va)) if len(np.unique(y_va)) > 1 else 0.5
+            )
+        fw = calculate_weighted_score(
+            fold_metrics["adopted_within_07_days_auc"], fold_metrics["adopted_within_07_days_ll"],
+            fold_metrics["adopted_within_90_days_auc"], fold_metrics["adopted_within_90_days_ll"],
+            fold_metrics["adopted_within_120_days_auc"], fold_metrics["adopted_within_120_days_ll"],
+        )
+        per_fold_weighted_scores.append(fw)
+        logger.info("  Fold %d: train=%d val=%d weighted=%.6f", fold, len(train_pos), len(val_pos), fw)
+
+    _cal = ll_calibration_per_target or {}
+    def _m(t: str) -> CalibrationMethod:
+        return _cal.get(t, CalibrationMethod.ISOTONIC)
+    oof_07_ll_r = oof_ll[TARGET_COLS[0]][oof_mask]
+    oof_90_ll_r = oof_ll[TARGET_COLS[1]][oof_mask]
+    oof_120_ll_r = oof_ll[TARGET_COLS[2]][oof_mask]
+    y07 = train_df[TARGET_COLS[0]].values[oof_mask]
+    y90 = train_df[TARGET_COLS[1]].values[oof_mask]
+    y120 = train_df[TARGET_COLS[2]].values[oof_mask]
+    c07 = Calibrator(_m(TARGET_COLS[0]))
+    c07.fit(y07, oof_07_ll_r)
+    c90 = Calibrator(_m(TARGET_COLS[1]))
+    c90.fit(y90, oof_90_ll_r)
+    c120 = Calibrator(_m(TARGET_COLS[2]))
+    c120.fit(y120, oof_120_ll_r)
+    oof_07_ll_cal = c07.transform(oof_07_ll_r)
+    oof_90_ll_cal = c90.transform(oof_90_ll_r)
+    oof_120_ll_cal = c120.transform(oof_120_ll_r)
+    oof_07_ll_cal, oof_90_ll_cal, oof_120_ll_cal = Calibrator.enforce_hierarchy(
+        oof_07_ll_cal, oof_90_ll_cal, oof_120_ll_cal
+    )
+    oof_07_auc = oof_07_ll_cal
+    oof_90_auc = oof_90_ll_cal
+    oof_120_auc = oof_120_ll_cal
+    oof_07_ll = float(log_loss(y07, oof_07_ll_cal))
+    oof_07_auc_s = float(roc_auc_score(y07, oof_07_auc)) if len(np.unique(y07)) > 1 else 0.5
+    oof_90_ll = float(log_loss(y90, oof_90_ll_cal))
+    oof_90_auc_s = float(roc_auc_score(y90, oof_90_auc)) if len(np.unique(y90)) > 1 else 0.5
+    oof_120_ll = float(log_loss(y120, oof_120_ll_cal))
+    oof_120_auc_s = float(roc_auc_score(y120, oof_120_auc)) if len(np.unique(y120)) > 1 else 0.5
+    ws = calculate_weighted_score(oof_07_auc_s, oof_07_ll, oof_90_auc_s, oof_90_ll, oof_120_auc_s, oof_120_ll)
+    fold_std = float(np.std(per_fold_weighted_scores)) if len(per_fold_weighted_scores) > 1 else 0.0
+    worst = min(per_fold_weighted_scores) if per_fold_weighted_scores else 0.0
+    last = per_fold_weighted_scores[-1] if per_fold_weighted_scores else 0.0
+    return {
+        "weighted_score": ws,
+        "per_fold_weighted_scores": per_fold_weighted_scores,
+        "fold_std": fold_std,
+        "worst_fold_score": worst,
+        "last_fold_score": last,
+        "oof_07_ll": oof_07_ll,
+        "oof_07_auc": oof_07_auc_s,
+        "oof_90_ll": oof_90_ll,
+        "oof_90_auc": oof_90_auc_s,
+        "oof_120_ll": oof_120_ll,
+        "oof_120_auc": oof_120_auc_s,
+    }
+
+
+def run_single_e10_harness_catboost(
+    train_df: pd.DataFrame,
+    prior_df: pd.DataFrame,
+    n_splits: int = E10_N_SPLITS,
+    seed: int = E10_SEED,
+    *,
+    ll_params_per_target: dict[str, dict] | None = None,
+    auc_params_per_target: dict[str, dict] | None = None,
+    num_boost_round: int | None = None,
+    feature_groups: dict[str, bool] | None = None,
+    ll_calibration_per_target: dict[str, CalibrationMethod] | None = None,
+) -> dict[str, Any]:
+    """Single model per target (CatBoost); vetted features (E10.5). Same prediction for LL and AUC."""
+    from catboost import CatBoostClassifier
+    from sklearn.metrics import log_loss, roc_auc_score
+
+    np.random.seed(seed)
+    train_df = train_df.copy()
+    prior_df = prior_df.copy()
+    prior_df[DATE_COL] = pd.to_datetime(prior_df[DATE_COL])
+    train_df[DATE_COL] = pd.to_datetime(train_df[DATE_COL])
+    if ll_params_per_target is None:
+        ll_params_per_target = {t: _default_catboost_ll_params(seed) for t in TARGET_COLS}
+    n_rounds = num_boost_round if num_boost_round is not None else NUM_BOOST_ROUND
+    feature_groups = feature_groups or VETTED_FEATURE_GROUPS
+
+    splits = rolling_forward_splits(
+        train_df, n_splits=n_splits, min_train_size=E10_MIN_TRAIN_SIZE
+    )
+    n_rows = len(train_df)
+    oof_ll = {t: np.zeros(n_rows, dtype=float) for t in TARGET_COLS}
+    oof_mask = np.zeros(n_rows, dtype=bool)
+    per_fold_weighted_scores: list[float] = []
+
+    for split in splits:
+        fold, train_pos, val_pos, train_cutoff = (
+            split["fold"], split["train_pos"], split["val_pos"], split["train_cutoff"],
+        )
+        prior_asof = prior_df[prior_df[DATE_COL] < train_cutoff].copy()
+        fe = FeatureEngineer(prior_asof)
+        fe.set_feature_groups(feature_groups)
+        fe.fit(train_df.iloc[train_pos])
+        X_tr = fe.transform(train_df.iloc[train_pos])
+        X_va = fe.transform(train_df.iloc[val_pos])
+        fold_metrics: dict[str, float] = {}
+        for target in TARGET_COLS:
+            y_tr = train_df[target].iloc[train_pos].values
+            y_va = train_df[target].iloc[val_pos].values
+            p = dict(ll_params_per_target[target])
+            p["iterations"] = p.get("iterations", n_rounds)
+            p["early_stopping_rounds"] = EARLY_STOPPING_ROUNDS
+            model = CatBoostClassifier(**p)
+            model.fit(X_tr, y_tr, eval_set=(X_va, y_va), verbose=False)
+            pred_va = np.clip(model.predict_proba(X_va)[:, 1], *E10_CLIP)
+            oof_ll[target][val_pos] = pred_va
+            oof_mask[val_pos] = True
+            fold_metrics[f"{target}_ll"] = float(log_loss(y_va, pred_va))
+            fold_metrics[f"{target}_auc"] = (
+                float(roc_auc_score(y_va, pred_va)) if len(np.unique(y_va)) > 1 else 0.5
+            )
+        fw = calculate_weighted_score(
+            fold_metrics["adopted_within_07_days_auc"], fold_metrics["adopted_within_07_days_ll"],
+            fold_metrics["adopted_within_90_days_auc"], fold_metrics["adopted_within_90_days_ll"],
+            fold_metrics["adopted_within_120_days_auc"], fold_metrics["adopted_within_120_days_ll"],
+        )
+        per_fold_weighted_scores.append(fw)
+        logger.info("  Fold %d: train=%d val=%d weighted=%.6f", fold, len(train_pos), len(val_pos), fw)
+
+    _cal = ll_calibration_per_target or {}
+    def _m(t: str) -> CalibrationMethod:
+        return _cal.get(t, CalibrationMethod.ISOTONIC)
+    oof_07_ll_r = oof_ll[TARGET_COLS[0]][oof_mask]
+    oof_90_ll_r = oof_ll[TARGET_COLS[1]][oof_mask]
+    oof_120_ll_r = oof_ll[TARGET_COLS[2]][oof_mask]
+    y07 = train_df[TARGET_COLS[0]].values[oof_mask]
+    y90 = train_df[TARGET_COLS[1]].values[oof_mask]
+    y120 = train_df[TARGET_COLS[2]].values[oof_mask]
+    c07, c90, c120 = Calibrator(_m(TARGET_COLS[0])), Calibrator(_m(TARGET_COLS[1])), Calibrator(_m(TARGET_COLS[2]))
+    c07.fit(y07, oof_07_ll_r)
+    c90.fit(y90, oof_90_ll_r)
+    c120.fit(y120, oof_120_ll_r)
+    oof_07_ll_cal = c07.transform(oof_07_ll_r)
+    oof_90_ll_cal = c90.transform(oof_90_ll_r)
+    oof_120_ll_cal = c120.transform(oof_120_ll_r)
+    oof_07_ll_cal, oof_90_ll_cal, oof_120_ll_cal = Calibrator.enforce_hierarchy(
+        oof_07_ll_cal, oof_90_ll_cal, oof_120_ll_cal
+    )
+    oof_07_auc = oof_07_ll_cal
+    oof_90_auc = oof_90_ll_cal
+    oof_120_auc = oof_120_ll_cal
+    oof_07_ll = float(log_loss(y07, oof_07_ll_cal))
+    oof_07_auc_s = float(roc_auc_score(y07, oof_07_auc)) if len(np.unique(y07)) > 1 else 0.5
+    oof_90_ll = float(log_loss(y90, oof_90_ll_cal))
+    oof_90_auc_s = float(roc_auc_score(y90, oof_90_auc)) if len(np.unique(y90)) > 1 else 0.5
+    oof_120_ll = float(log_loss(y120, oof_120_ll_cal))
+    oof_120_auc_s = float(roc_auc_score(y120, oof_120_auc)) if len(np.unique(y120)) > 1 else 0.5
+    ws = calculate_weighted_score(oof_07_auc_s, oof_07_ll, oof_90_auc_s, oof_90_ll, oof_120_auc_s, oof_120_ll)
+    fold_std = float(np.std(per_fold_weighted_scores)) if len(per_fold_weighted_scores) > 1 else 0.0
+    worst = min(per_fold_weighted_scores) if per_fold_weighted_scores else 0.0
+    last = per_fold_weighted_scores[-1] if per_fold_weighted_scores else 0.0
+    return {
+        "weighted_score": ws,
+        "per_fold_weighted_scores": per_fold_weighted_scores,
+        "fold_std": fold_std,
+        "worst_fold_score": worst,
+        "last_fold_score": last,
+        "oof_07_ll": oof_07_ll,
+        "oof_07_auc": oof_07_auc_s,
+        "oof_90_ll": oof_90_ll,
+        "oof_90_auc": oof_90_auc_s,
+        "oof_120_ll": oof_120_ll,
+        "oof_120_auc": oof_120_auc_s,
     }
 
 
@@ -544,87 +835,31 @@ def run_hpo(args: argparse.Namespace, sampler=None) -> int:
     for log in _noisy_loggers:
         log.setLevel(logging.WARNING)
 
-    # Study key: which head to tune (one at a time; others use defaults)
+    # Study key: which target to tune (7d, 90d, 120d). Single model per target.
     def _make_objective(study_key: str):
-        """Build Optuna objective for a single head (e.g. 7d_ll). Only that head is tuned."""
+        """Build Optuna objective for one target. Only that target's params are tuned."""
 
         def objective(trial: optuna.Trial) -> float:
             ll_params_per_target = {t: _default_ll_params(E10_SEED) for t in TARGET_COLS}
-            auc_params_per_target = {t: _default_auc_params(E10_SEED) for t in TARGET_COLS}
             num_rounds = trial.suggest_int("num_boost_round", 300, 1500)
-
-            if study_key == "7d_ll":
-                ll_params_per_target[TARGET_COLS[0]] = {
-                    **_default_ll_params(E10_SEED),
-                    "learning_rate": trial.suggest_float("lr", 0.01, 0.08),
-                    "num_leaves": trial.suggest_int("num_leaves", 15, 45),
-                    "max_depth": trial.suggest_int("max_depth", 4, 7),
-                    "min_child_samples": trial.suggest_int("min_child_samples", 30, 80),
-                    "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
-                    "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
-                    "lambda_l1": trial.suggest_float("lambda_l1", 0.1, 2.0),
-                    "lambda_l2": trial.suggest_float("lambda_l2", 0.5, 3.0),
-                }
-            elif study_key == "7d_auc":
-                auc_params_per_target[TARGET_COLS[0]] = {
-                    **_default_auc_params(E10_SEED),
-                    "learning_rate": trial.suggest_float("lr", 0.02, 0.08),
-                    "num_leaves": trial.suggest_int("num_leaves", 40, 90),
-                    "max_depth": trial.suggest_int("max_depth", 5, 8),
-                    "min_child_samples": trial.suggest_int("min_child_samples", 15, 40),
-                    "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
-                    "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
-                    "lambda_l1": trial.suggest_float("lambda_l1", 0.02, 0.3),
-                    "lambda_l2": trial.suggest_float("lambda_l2", 0.2, 1.0),
-                }
-            elif study_key == "90d_ll":
-                ll_params_per_target[TARGET_COLS[1]] = {
-                    **_default_ll_params(E10_SEED),
-                    "learning_rate": trial.suggest_float("lr", 0.01, 0.08),
-                    "num_leaves": trial.suggest_int("num_leaves", 15, 45),
-                    "max_depth": trial.suggest_int("max_depth", 4, 7),
-                    "min_child_samples": trial.suggest_int("min_child_samples", 30, 80),
-                    "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
-                    "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
-                    "lambda_l1": trial.suggest_float("lambda_l1", 0.1, 2.0),
-                    "lambda_l2": trial.suggest_float("lambda_l2", 0.5, 3.0),
-                }
-            elif study_key == "90d_auc":
-                auc_params_per_target[TARGET_COLS[1]] = {
-                    **_default_auc_params(E10_SEED),
-                    "learning_rate": trial.suggest_float("lr", 0.02, 0.08),
-                    "num_leaves": trial.suggest_int("num_leaves", 40, 90),
-                    "max_depth": trial.suggest_int("max_depth", 5, 8),
-                    "min_child_samples": trial.suggest_int("min_child_samples", 15, 40),
-                    "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
-                    "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
-                    "lambda_l1": trial.suggest_float("lambda_l1", 0.02, 0.3),
-                    "lambda_l2": trial.suggest_float("lambda_l2", 0.2, 1.0),
-                }
-            elif study_key == "120d_ll":
-                ll_params_per_target[TARGET_COLS[2]] = {
-                    **_default_ll_params(E10_SEED),
-                    "learning_rate": trial.suggest_float("lr", 0.01, 0.08),
-                    "num_leaves": trial.suggest_int("num_leaves", 15, 45),
-                    "max_depth": trial.suggest_int("max_depth", 4, 7),
-                    "min_child_samples": trial.suggest_int("min_child_samples", 30, 80),
-                    "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
-                    "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
-                    "lambda_l1": trial.suggest_float("lambda_l1", 0.1, 2.0),
-                    "lambda_l2": trial.suggest_float("lambda_l2", 0.5, 3.0),
-                }
-            elif study_key == "120d_auc":
-                auc_params_per_target[TARGET_COLS[2]] = {
-                    **_default_auc_params(E10_SEED),
-                    "learning_rate": trial.suggest_float("lr", 0.02, 0.08),
-                    "num_leaves": trial.suggest_int("num_leaves", 40, 90),
-                    "max_depth": trial.suggest_int("max_depth", 5, 8),
-                    "min_child_samples": trial.suggest_int("min_child_samples", 15, 40),
-                    "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
-                    "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
-                    "lambda_l1": trial.suggest_float("lambda_l1", 0.02, 0.3),
-                    "lambda_l2": trial.suggest_float("lambda_l2", 0.2, 1.0),
-                }
+            base = _default_ll_params(E10_SEED)
+            tuned = {
+                **base,
+                "learning_rate": trial.suggest_float("lr", 0.01, 0.08),
+                "num_leaves": trial.suggest_int("num_leaves", 15, 45),
+                "max_depth": trial.suggest_int("max_depth", 4, 7),
+                "min_child_samples": trial.suggest_int("min_child_samples", 30, 80),
+                "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
+                "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
+                "lambda_l1": trial.suggest_float("lambda_l1", 0.1, 2.0),
+                "lambda_l2": trial.suggest_float("lambda_l2", 0.5, 3.0),
+            }
+            if study_key == "7d":
+                ll_params_per_target[TARGET_COLS[0]] = tuned
+            elif study_key == "90d":
+                ll_params_per_target[TARGET_COLS[1]] = tuned
+            else:
+                ll_params_per_target[TARGET_COLS[2]] = tuned
 
             result = run_single_e10_harness(
                 train_df,
@@ -632,24 +867,21 @@ def run_hpo(args: argparse.Namespace, sampler=None) -> int:
                 n_splits=args.n_splits,
                 seed=E10_SEED,
                 ll_params_per_target=ll_params_per_target,
-                auc_params_per_target=auc_params_per_target,
                 num_boost_round=num_rounds,
             )
             score = result["weighted_score"]
-            # Guardrails: fail trial if constraints violated
             if result["oof_07_ll"] > baseline_7d_ll + 1e-6:
                 return 0.0
             if result["worst_fold_score"] < baseline_worst_fold - 1e-6:
                 return 0.0
-            max_std = baseline_fold_std * 1.5 + 0.01
-            if result["fold_std"] > max_std:
+            if result["fold_std"] > baseline_fold_std * 1.5 + 0.01:
                 return 0.0
             return score
 
         return objective
 
     studies_to_run = (
-        ["7d_ll", "7d_auc", "90d_ll", "90d_auc", "120d_ll", "120d_auc"]
+        ["7d", "90d", "120d"]
         if args.study == "all"
         else [args.study]
     )
@@ -733,16 +965,8 @@ def main() -> None:
     p_hpo.add_argument(
         "--study",
         type=str,
-        default="7d_ll",
-        choices=[
-            "7d_ll",
-            "7d_auc",
-            "90d_ll",
-            "90d_auc",
-            "120d_ll",
-            "120d_auc",
-            "all",
-        ],
+        default="7d",
+        choices=["7d", "90d", "120d", "all"],
         help="Which head(s) to tune (one study per head if 'all')",
     )
     p_hpo.add_argument("--n-splits", type=int, default=E10_N_SPLITS)

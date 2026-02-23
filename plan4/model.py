@@ -29,7 +29,7 @@ from plan4.config import (
     N_CV_FOLDS,
     NUM_BOOST_ROUND,
 )
-from shared.calibration import Calibrator, CalibrationMethod
+from shared.calibration import Calibrator, CalibrationMethod, get_default_calibration_method
 from shared.constants import (
     CV_STRATEGY_DEFAULT,
     CV_TIME_CUTOFF_DEFAULT,
@@ -147,7 +147,7 @@ class DualOptimiser:
             cv_result.add(ll_result)
 
             # Calibrate LogLoss predictions (critical for 75 % weight)
-            cal_ll = Calibrator(CalibrationMethod.ISOTONIC)
+            cal_ll = Calibrator(get_default_calibration_method())
             cal_ll.fit(y.values[oof_ll_mask], oof_ll[oof_ll_mask])
             preds_logloss[target] = cal_ll.transform(test_ll)
             if write_train_submission:

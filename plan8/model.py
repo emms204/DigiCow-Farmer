@@ -15,7 +15,7 @@ import pandas as pd
 
 from shared.constants import DATE_COL, FARMER_COL, TARGET_COLS, TOPICS_COL
 from shared.feature_engineering import FeatureEngineer
-from shared.calibration import Calibrator, CalibrationMethod
+from shared.calibration import Calibrator, CalibrationMethod, get_default_calibration_method
 
 from plan8.config import (
     CALIBRATOR_OPTIONS,
@@ -187,6 +187,9 @@ def run_plan8_oof(
         oof_mask[val_pos] = True
 
     # Cohort-wise calibration: 4 cohorts x 3 targets -> choose calibrator by OOF LL
+    # When global calibration is off, only use NONE per cohort
+    default_cal = get_default_calibration_method()
+    cal_options = ["none"] if default_cal == CalibrationMethod.NONE else CALIBRATOR_OPTIONS
     method_map = {"none": CalibrationMethod.NONE, "platt": CalibrationMethod.PLATT, "isotonic": CalibrationMethod.ISOTONIC}
     calibrators: dict[int, tuple[Calibrator, Calibrator, Calibrator]] = {}
 
@@ -204,7 +207,7 @@ def run_plan8_oof(
 
         best_ll = 1e9
         best_cals = (Calibrator(CalibrationMethod.NONE), Calibrator(CalibrationMethod.NONE), Calibrator(CalibrationMethod.NONE))
-        for opt in CALIBRATOR_OPTIONS:
+        for opt in cal_options:
             method = method_map[opt]
             c07 = Calibrator(method)
             c90 = Calibrator(method)

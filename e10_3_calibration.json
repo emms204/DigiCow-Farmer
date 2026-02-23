@@ -1,0 +1,10 @@
+{
+  "calibration_per_target": {
+    "adopted_within_07_days": "isotonic",
+    "adopted_within_90_days": "isotonic",
+    "adopted_within_120_days": "isotonic"
+  },
+  "baseline_weighted": 0.8894521798166416,
+  "final_weighted": 0.8894521798166416,
+  "delta": 0.0
+}

@@ -1,13 +1,8 @@
 """
 Plan 5 — Prior-history feature-dominant + simple calibrated model.
 
-Philosophy: since 62.7 % of test farmers have history in Prior, and
-``has_topic_trained_on == 0`` means zero adoption, the signal is
-largely in feature engineering rather than model complexity.
-
-A regularised Logistic Regression is inherently well-calibrated (no
-post-hoc calibration needed) and immune to overfitting on small data,
-making it ideal for the 75 % Log Loss evaluation weight.
+Dual columns: Logistic Regression (well-calibrated) → LogLoss columns;
+LightGBM optimised for AUC → AUC columns.
 
 Additional enrichment:
     - Per-farmer interaction features (history × current context).
@@ -20,13 +15,15 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
+from plan4.config import AUC_PARAMS, EARLY_STOPPING_ROUNDS, NUM_BOOST_ROUND
 from plan5.config import ELASTIC_NET_PARAMS, N_CV_FOLDS
-from shared.calibration import Calibrator
+from shared.calibration import Calibrator, CalibrationMethod, get_default_calibration_method
 from shared.constants import (
     CV_STRATEGY_DEFAULT,
     CV_TIME_CUTOFF_DEFAULT,
@@ -111,13 +108,12 @@ class SimpleModel:
         validator = Validator(n_splits=self.n_folds)
         cv_result = CVResult()
         predictions: dict[str, np.ndarray] = {}
+        predictions_auc: dict[str, np.ndarray] = {}
 
         for target in TARGET_COLS:
             y = train_df[target]
             logger.info("── Target: %s (pos_rate=%.4f) ──", target, y.mean())
 
-            # CV evaluation (no calibration needed — LR is already calibrated)
-            oof_preds = np.zeros(len(y))
             splits = list(
                 validator.cv_splits(
                     train_df,
@@ -126,45 +122,83 @@ class SimpleModel:
                     cutoff=self.cv_time_cutoff,
                 )
             )
+
+            # Model A: Logistic Regression → LogLoss columns
+            logger.info("  Training Model A (LogLoss / LR) …")
+            oof_preds = np.zeros(len(y))
+            oof_mask_ll = np.zeros(len(y), dtype=bool)
             for fold_idx, (tr_idx, va_idx) in enumerate(splits):
                 model = LogisticRegression(**self.params)
                 model.fit(X_train_scaled.iloc[tr_idx], y.iloc[tr_idx])
                 oof_preds[va_idx] = model.predict_proba(
                     X_train_scaled.iloc[va_idx]
                 )[:, 1]
-
+                oof_mask_ll[va_idx] = True
                 fold_result = validator.evaluate(
-                    y.iloc[va_idx].values, oof_preds[va_idx], target, fold_idx
+                    y.iloc[va_idx].values, oof_preds[va_idx], f"{target}_LL", fold_idx
                 )
                 cv_result.add(fold_result)
-
-            # Train final model on all data
-            final_model = LogisticRegression(**self.params)
-            final_model.fit(X_train_scaled, y)
-
-            # Log top features by coefficient magnitude
+            final_lr = LogisticRegression(**self.params)
+            final_lr.fit(X_train_scaled, y)
             coef = pd.Series(
-                final_model.coef_[0], index=X_train_scaled.columns
+                final_lr.coef_[0], index=X_train_scaled.columns
             ).abs().sort_values(ascending=False)
-            logger.info(
-                "  Top 10 features:\n%s",
-                coef.head(10).to_string(),
-            )
+            logger.info("  Top 10 features:\n%s", coef.head(10).to_string())
+            raw_ll = final_lr.predict_proba(X_test_scaled)[:, 1]
+            cal_method = get_default_calibration_method()
+            if cal_method != CalibrationMethod.NONE:
+                cal = Calibrator(cal_method)
+                cal.fit(y.values[oof_mask_ll], oof_preds[oof_mask_ll])
+                predictions[target] = np.clip(cal.transform(raw_ll), 0.001, 0.999)
+            else:
+                predictions[target] = np.clip(raw_ll, 0.001, 0.999)
 
-            # Predict on test (no additional calibration)
-            predictions[target] = np.clip(
-                final_model.predict_proba(X_test_scaled)[:, 1], 0.001, 0.999
+            # Model B: LightGBM AUC → AUC columns
+            logger.info("  Training Model B (AUC / LightGBM) …")
+            oof_auc = np.zeros(len(y))
+            oof_auc_mask = np.zeros(len(y), dtype=bool)
+            test_auc_sum = np.zeros(len(X_test_scaled))
+            n_folds_eff = len(splits)
+            for fold_idx, (tr_idx, va_idx) in enumerate(splits):
+                train_ds = lgb.Dataset(
+                    X_train_scaled.iloc[tr_idx], label=y.iloc[tr_idx], free_raw_data=False
+                )
+                val_ds = lgb.Dataset(
+                    X_train_scaled.iloc[va_idx], label=y.iloc[va_idx], free_raw_data=False
+                )
+                booster = lgb.train(
+                    AUC_PARAMS,
+                    train_ds,
+                    num_boost_round=NUM_BOOST_ROUND,
+                    valid_sets=[train_ds, val_ds],
+                    valid_names=["train", "valid"],
+                    callbacks=[lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False)],
+                )
+                oof_auc[va_idx] = booster.predict(
+                    X_train_scaled.iloc[va_idx], num_iteration=booster.best_iteration
+                )
+                oof_auc_mask[va_idx] = True
+                test_auc_sum += (
+                    booster.predict(X_test_scaled, num_iteration=booster.best_iteration)
+                    / n_folds_eff
+                )
+            cv_result.add(
+                validator.evaluate(
+                    y.values[oof_auc_mask], oof_auc[oof_auc_mask], f"{target}_AUC", fold=99
+                )
             )
+            predictions_auc[target] = np.clip(test_auc_sum, 0.001, 0.999)
 
-        # Enforce hierarchy
-        p07, p90, p120 = Calibrator.enforce_hierarchy(
-            predictions[TARGET_COLS[0]],
-            predictions[TARGET_COLS[1]],
-            predictions[TARGET_COLS[2]],
-        )
-        predictions[TARGET_COLS[0]] = p07
-        predictions[TARGET_COLS[1]] = p90
-        predictions[TARGET_COLS[2]] = p120
+        # Enforce hierarchy on both
+        for pred_dict in (predictions, predictions_auc):
+            p07, p90, p120 = Calibrator.enforce_hierarchy(
+                pred_dict[TARGET_COLS[0]],
+                pred_dict[TARGET_COLS[1]],
+                pred_dict[TARGET_COLS[2]],
+            )
+            pred_dict[TARGET_COLS[0]] = p07
+            pred_dict[TARGET_COLS[1]] = p90
+            pred_dict[TARGET_COLS[2]] = p120
 
         # Log summary
         summary = cv_result.summary()
@@ -174,7 +208,10 @@ class SimpleModel:
         filename = submission_filename or f"{self.plan_name}_submission.csv"
         gen = SubmissionGenerator(sample_sub)
         path = gen.generate(
-            test_ids=test_df[ID_COL], predictions=predictions, filename=filename
+            test_ids=test_df[ID_COL],
+            predictions=predictions,
+            predictions_auc=predictions_auc,
+            filename=filename,
         )
 
         logger.info("✓ %s complete → %s", self.plan_name, path)

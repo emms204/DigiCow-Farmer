@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Protocol
 
 import lightgbm as lgb
@@ -26,17 +27,20 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 from plan3.config import (
+    CATBOOST_AUC_PARAMS,
     CATBOOST_PARAMS,
     EARLY_STOPPING_ROUNDS,
+    LGBM_AUC_PARAMS,
     LGBM_PARAMS,
     LR_PARAMS,
     META_LR_PARAMS,
     N_CV_FOLDS,
     NUM_BOOST_ROUND,
     RF_PARAMS,
+    XGB_AUC_PARAMS,
     XGB_PARAMS,
 )
-from shared.calibration import Calibrator, CalibrationMethod
+from shared.calibration import Calibrator, CalibrationMethod, get_default_calibration_method
 from shared.constants import (
     CV_STRATEGY_DEFAULT,
     CV_TIME_CUTOFF_DEFAULT,
@@ -74,11 +78,12 @@ class BaseLearner(Protocol):
 # ── Concrete base learners ─────────────────────────────────────────────
 
 class LGBMLearner:
-    """LightGBM base learner wrapper."""
+    """LightGBM base learner wrapper (params = LogLoss or AUC)."""
 
     name: str = "lgbm"
 
-    def __init__(self) -> None:
+    def __init__(self, params: dict | None = None) -> None:
+        self._params = params or LGBM_PARAMS
         self._model: lgb.Booster | None = None
 
     def fit(
@@ -92,15 +97,13 @@ class LGBMLearner:
         callbacks = [lgb.log_evaluation(period=0)]
         valid_sets = [train_ds]
         valid_names = ["train"]
-
         if X_val is not None and y_val is not None:
             val_ds = lgb.Dataset(X_val, label=y_val, free_raw_data=False)
             valid_sets.append(val_ds)
             valid_names.append("valid")
             callbacks.append(lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False))
-
         self._model = lgb.train(
-            LGBM_PARAMS,
+            self._params,
             train_ds,
             num_boost_round=NUM_BOOST_ROUND,
             valid_sets=valid_sets,
@@ -113,13 +116,17 @@ class LGBMLearner:
 
 
 class XGBLearner:
-    """XGBoost base learner wrapper."""
+    """XGBoost base learner wrapper (params = LogLoss or AUC)."""
 
     name: str = "xgb"
 
-    def __init__(self, scale_pos_weight: float = 1.0) -> None:
+    def __init__(
+        self,
+        scale_pos_weight: float = 1.0,
+        params: dict | None = None,
+    ) -> None:
         self._model: xgb.Booster | None = None
-        self._params = XGB_PARAMS.copy()
+        self._params = (params or XGB_PARAMS).copy()
         self._params["scale_pos_weight"] = scale_pos_weight
 
     def fit(
@@ -151,11 +158,12 @@ class XGBLearner:
 
 
 class CatBoostLearner:
-    """CatBoost base learner wrapper."""
+    """CatBoost base learner wrapper (params = LogLoss or AUC)."""
 
     name: str = "catboost"
 
-    def __init__(self) -> None:
+    def __init__(self, params: dict | None = None) -> None:
+        self._params = params or CATBOOST_PARAMS
         self._model: CatBoostClassifier | None = None
 
     def fit(
@@ -165,7 +173,7 @@ class CatBoostLearner:
         X_val: pd.DataFrame | None = None,
         y_val: pd.Series | None = None,
     ) -> None:
-        self._model = CatBoostClassifier(**CATBOOST_PARAMS)
+        self._model = CatBoostClassifier(**self._params)
         eval_set = None
         if X_val is not None and y_val is not None:
             eval_set = Pool(X_val, label=y_val)
@@ -264,16 +272,19 @@ class StackingEnsemble:
         self.cv_time_cutoff = cv_time_cutoff
         self.plan_name = "plan3_stacking"
 
-    def _create_base_learners(self, pos_rate: float) -> list:
-        """Instantiate a fresh set of diverse base learners.
-
-        Parameters
-        ----------
-        pos_rate : float
-            Positive class rate for the current target, used to set
-            ``scale_pos_weight`` for XGBoost.
-        """
+    def _create_base_learners(
+        self, pos_rate: float, for_auc: bool = False
+    ) -> list:
+        """Instantiate a fresh set of base learners (LogLoss or AUC tuned)."""
         spw = (1.0 - pos_rate) / max(pos_rate, 1e-6)
+        if for_auc:
+            return [
+                LGBMLearner(LGBM_AUC_PARAMS),
+                XGBLearner(scale_pos_weight=spw, params=XGB_AUC_PARAMS),
+                CatBoostLearner(CATBOOST_AUC_PARAMS),
+                RFLearner(),
+                LRLearner(),
+            ]
         return [
             LGBMLearner(),
             XGBLearner(scale_pos_weight=spw),
@@ -316,6 +327,7 @@ class StackingEnsemble:
         validator = Validator(n_splits=self.n_folds)
         cv_result = CVResult()
         predictions: dict[str, np.ndarray] = {}
+        predictions_auc: dict[str, np.ndarray] = {}
         oof_predictions: dict[str, np.ndarray] = {}
         oof_mask_per_target: dict[str, np.ndarray] = {}
 
@@ -324,16 +336,6 @@ class StackingEnsemble:
             pos_rate = y.mean()
             logger.info("── Target: %s (pos_rate=%.4f) ──", target, pos_rate)
 
-            base_learners = self._create_base_learners(pos_rate)
-            n_base = len(base_learners)
-
-            # OOF matrix: (n_train, n_base)
-            oof_matrix = np.zeros((len(y), n_base))
-            oof_mask = np.zeros(len(y), dtype=bool)
-            # Test predictions: (n_base, n_folds, n_test) → averaged
-            test_preds_per_base = np.zeros((n_base, len(X_test)))
-
-            # 2a. Generate OOF predictions
             folds = list(
                 validator.cv_splits(
                     train_df,
@@ -343,53 +345,90 @@ class StackingEnsemble:
                 )
             )
             n_folds_eff = len(folds)
+
+            # ── Stack A: LogLoss-optimised base learners ─────────────────
+            logger.info("  Training Stack A (LogLoss-optimised) …")
+            base_learners_ll = self._create_base_learners(pos_rate, for_auc=False)
+            n_base = len(base_learners_ll)
+            oof_matrix = np.zeros((len(y), n_base))
+            oof_mask = np.zeros(len(y), dtype=bool)
+            test_preds_per_base = np.zeros((n_base, len(X_test)))
             for fold_idx, (tr_idx, va_idx) in enumerate(folds):
                 X_tr, X_va = X_train.iloc[tr_idx], X_train.iloc[va_idx]
                 y_tr, y_va = y.iloc[tr_idx], y.iloc[va_idx]
                 oof_mask[va_idx] = True
-
-                fold_learners = self._create_base_learners(pos_rate)
+                fold_learners = self._create_base_learners(pos_rate, for_auc=False)
                 for i, learner in enumerate(fold_learners):
                     learner.fit(X_tr, y_tr, X_va, y_va)
                     oof_matrix[va_idx, i] = learner.predict_proba(X_va)
                     test_preds_per_base[i] += (
                         learner.predict_proba(X_test) / n_folds_eff
                     )
-
-            # Evaluate OOF ensemble (simple average first)
             oof_avg = oof_matrix.mean(axis=1)
-            fold_result = validator.evaluate(
-                y.values[oof_mask], oof_avg[oof_mask], target, fold=99
+            cv_result.add(
+                validator.evaluate(
+                    y.values[oof_mask], oof_avg[oof_mask], f"{target}_LL", fold=99
+                )
             )
-            cv_result.add(fold_result)
-
-            # 2b. Train meta-learner on OOF matrix
-            meta = LogisticRegression(**META_LR_PARAMS)
-            meta.fit(oof_matrix, y)
-            logger.info(
-                "  Meta-learner coefficients: %s",
-                dict(zip(
-                    [l.name for l in base_learners],
-                    np.round(meta.coef_[0], 4),
-                )),
-            )
-
-            # 2c. Build test meta-features & predict
-            test_meta = test_preds_per_base.T  # (n_test, n_base)
-            predictions[target] = meta.predict_proba(test_meta)[:, 1]
+            meta_ll = LogisticRegression(**META_LR_PARAMS)
+            meta_ll.fit(oof_matrix, y)
+            test_meta = test_preds_per_base.T
+            raw_ll = meta_ll.predict_proba(test_meta)[:, 1]
+            oof_ll = meta_ll.predict_proba(oof_matrix)[:, 1]
+            cal_method = get_default_calibration_method()
+            if cal_method != CalibrationMethod.NONE:
+                cal = Calibrator(cal_method)
+                cal.fit(y.values[oof_mask], oof_ll[oof_mask])
+                predictions[target] = cal.transform(raw_ll)
+            else:
+                predictions[target] = np.clip(raw_ll, 0.001, 0.999)
             if write_train_submission:
-                oof_predictions[target] = meta.predict_proba(oof_matrix)[:, 1]
+                oof_predictions[target] = oof_ll if cal_method == CalibrationMethod.NONE else cal.transform(oof_ll)
                 oof_mask_per_target[target] = oof_mask.copy()
 
-        # 3. Enforce hierarchy
-        p07, p90, p120 = Calibrator.enforce_hierarchy(
-            predictions[TARGET_COLS[0]],
-            predictions[TARGET_COLS[1]],
-            predictions[TARGET_COLS[2]],
-        )
-        predictions[TARGET_COLS[0]] = p07
-        predictions[TARGET_COLS[1]] = p90
-        predictions[TARGET_COLS[2]] = p120
+            # ── Stack B: AUC-optimised base learners ─────────────────────
+            logger.info("  Training Stack B (AUC-optimised) …")
+            base_learners_auc = self._create_base_learners(pos_rate, for_auc=True)
+            oof_matrix_auc = np.zeros((len(y), n_base))
+            oof_mask_auc = np.zeros(len(y), dtype=bool)
+            test_preds_auc_base = np.zeros((n_base, len(X_test)))
+            for fold_idx, (tr_idx, va_idx) in enumerate(folds):
+                X_tr, X_va = X_train.iloc[tr_idx], X_train.iloc[va_idx]
+                y_tr, y_va = y.iloc[tr_idx], y.iloc[va_idx]
+                oof_mask_auc[va_idx] = True
+                fold_learners = self._create_base_learners(pos_rate, for_auc=True)
+                for i, learner in enumerate(fold_learners):
+                    learner.fit(X_tr, y_tr, X_va, y_va)
+                    oof_matrix_auc[va_idx, i] = learner.predict_proba(X_va)
+                    test_preds_auc_base[i] += (
+                        learner.predict_proba(X_test) / n_folds_eff
+                    )
+            oof_avg_auc = oof_matrix_auc.mean(axis=1)
+            cv_result.add(
+                validator.evaluate(
+                    y.values[oof_mask_auc],
+                    oof_avg_auc[oof_mask_auc],
+                    f"{target}_AUC",
+                    fold=99,
+                )
+            )
+            meta_auc = LogisticRegression(**META_LR_PARAMS)
+            meta_auc.fit(oof_matrix_auc, y)
+            test_meta_auc = test_preds_auc_base.T
+            predictions_auc[target] = np.clip(
+                meta_auc.predict_proba(test_meta_auc)[:, 1], 0.001, 0.999
+            )
+
+        # 3. Enforce hierarchy on both
+        for pred_dict in (predictions, predictions_auc):
+            p07, p90, p120 = Calibrator.enforce_hierarchy(
+                pred_dict[TARGET_COLS[0]],
+                pred_dict[TARGET_COLS[1]],
+                pred_dict[TARGET_COLS[2]],
+            )
+            pred_dict[TARGET_COLS[0]] = p07
+            pred_dict[TARGET_COLS[1]] = p90
+            pred_dict[TARGET_COLS[2]] = p120
 
         # Log summary
         summary = cv_result.summary()
@@ -419,10 +458,15 @@ class StackingEnsemble:
             sub.to_csv(out, index=False)
             logger.info("Train (OOF) submission written to %s  (%d rows)", out, len(sub))
 
-        # Write submission
+        # Write submission (LogLoss stack → LL columns, AUC stack → AUC columns)
         filename = submission_filename or f"{self.plan_name}_submission.csv"
         gen = SubmissionGenerator(sample_sub)
-        path = gen.generate(test_ids=test_df[ID_COL], predictions=predictions, filename=filename)
+        path = gen.generate(
+            test_ids=test_df[ID_COL],
+            predictions=predictions,
+            predictions_auc=predictions_auc,
+            filename=filename,
+        )
 
         logger.info("✓ %s complete → %s", self.plan_name, path)
         return path
