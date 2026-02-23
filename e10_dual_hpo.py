@@ -456,9 +456,38 @@ def _load_baseline() -> dict[str, Any]:
     if not E10_BASELINE_PATH.exists():
         raise FileNotFoundError(
             f"E10 baseline not found at {E10_BASELINE_PATH}. Run E10.0 first: "
-            "python e10_dual_hpo.py baseline"
+            "python e10_dual_hpo.py baseline  (or use hpo --run-baseline-if-missing)"
         )
     return json.loads(E10_BASELINE_PATH.read_text(encoding="utf-8"))
+
+
+def _run_and_save_baseline_once(
+    train_df: pd.DataFrame,
+    prior_df: pd.DataFrame,
+    n_splits: int = E10_N_SPLITS,
+) -> dict[str, Any]:
+    """Run one E10 harness and save result as baseline (e.g. for Colab when no prior run)."""
+    logger.info("Running one E10.0 harness to create baseline at %s ...", E10_BASELINE_PATH)
+    result = run_single_e10_harness(
+        train_df, prior_df, n_splits=n_splits, seed=E10_SEED
+    )
+    payload = {
+        "weighted_score": result["weighted_score"],
+        "oof_07_ll": result["oof_07_ll"],
+        "oof_07_auc": result["oof_07_auc"],
+        "oof_90_ll": result["oof_90_ll"],
+        "oof_90_auc": result["oof_90_auc"],
+        "oof_120_ll": result["oof_120_ll"],
+        "oof_120_auc": result["oof_120_auc"],
+        "per_fold_weighted_scores": result["per_fold_weighted_scores"],
+        "fold_std": result["fold_std"],
+        "worst_fold_score": result["worst_fold_score"],
+    }
+    E10_BASELINE_PATH.write_text(
+        json.dumps(payload, indent=2), encoding="utf-8"
+    )
+    logger.info("  Baseline saved: weighted=%.6f", result["weighted_score"])
+    return payload
 
 
 def run_hpo(args: argparse.Namespace) -> int:
@@ -468,6 +497,13 @@ def run_hpo(args: argparse.Namespace) -> int:
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     os.environ["DIGICOW_MINIMAL_FEATURES"] = "1"
 
+    loader = DataLoader()
+    train_df, _test_df, prior_df, _ = loader.load_all()
+    train_df[DATE_COL] = pd.to_datetime(train_df[DATE_COL])
+    prior_df[DATE_COL] = pd.to_datetime(prior_df[DATE_COL])
+
+    if not E10_BASELINE_PATH.exists() and getattr(args, "run_baseline_if_missing", False):
+        _run_and_save_baseline_once(train_df, prior_df, n_splits=args.n_splits)
     baseline = _load_baseline()
     baseline_weighted = baseline["weighted_score"]
     baseline_7d_ll = baseline["oof_07_ll"]
@@ -480,11 +516,6 @@ def run_hpo(args: argparse.Namespace) -> int:
     logger.info("  Guardrails: 7d_ll not worse, worst_fold not worse, fold_std controlled")
     logger.info("  Pass rule: Δweighted >= +%.4f", E10_PASS_DELTA_HPO)
     logger.info("=" * 70)
-
-    loader = DataLoader()
-    train_df, _test_df, prior_df, _ = loader.load_all()
-    train_df[DATE_COL] = pd.to_datetime(train_df[DATE_COL])
-    prior_df[DATE_COL] = pd.to_datetime(prior_df[DATE_COL])
 
     # Study key: which head to tune (one at a time; others use defaults)
     def _make_objective(study_key: str):
@@ -674,6 +705,11 @@ def main() -> None:
         help="Which head(s) to tune (one study per head if 'all')",
     )
     p_hpo.add_argument("--n-splits", type=int, default=E10_N_SPLITS)
+    p_hpo.add_argument(
+        "--run-baseline-if-missing",
+        action="store_true",
+        help="If e10_baseline.json is missing, run one E10.0 harness and save it (e.g. on Colab)",
+    )
 
     args = parser.parse_args()
 
