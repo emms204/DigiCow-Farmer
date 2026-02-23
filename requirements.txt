@@ -1,23 +1,23 @@
 # Core data + metrics
-numpy>=1.26,<3.0
-pandas>=2.1,<3.0
-scipy>=1.11,<2.0
-scikit-learn>=1.4,<2.0
-joblib>=1.3,<2.0
-tqdm>=4.66,<5.0
+numpy
+pandas
+scipy
+scikit-learn
+joblib
+tqdm
 
 # Gradient boosting / tabular models (Plans 1-5, 8-10)
-lightgbm>=4.3,<5.0
-xgboost>=2.0,<3.0
-catboost>=1.2,<2.0
+lightgbm
+xgboost
+catboost
 
 # Hyperparameter optimization (E10)
-optuna>=3.6,<5.0
+optuna
 
 # Deep learning (Plan 6)
-torch>=2.2,<3.0
+torch
 
 # Graph / embedding stack (Plan 9 View C Node2Vec)
-networkx>=3.2,<4.0
-gensim>=4.3,<5.0
-node2vec>=0.4.6,<0.5
+networkx
+gensim
+node2vec
